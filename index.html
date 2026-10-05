@@ -36,6 +36,10 @@ button{font-family:inherit;cursor:pointer}
 header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;padding-bottom:14px;border-bottom:1px solid var(--line);margin-bottom:16px}
 .brand h1{font-size:26px;color:var(--gold);letter-spacing:.06em}
 .brand p{margin:2px 0 0;color:var(--muted);font-size:13px}
+.sync{display:inline-flex;align-items:center;gap:6px;margin-top:4px;font-size:12px;color:var(--muted)}
+.sync::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--muted)}
+.sync.ok::before{background:var(--ok)}
+.sync.off::before{background:var(--danger)}
 .btns{display:flex;flex-wrap:wrap;gap:8px}
 .btn{border:1px solid var(--line);background:var(--panel);color:var(--text);padding:8px 14px;border-radius:10px;font-weight:700;font-size:13px}
 .btn:hover{border-color:var(--gold)}
@@ -138,6 +142,7 @@ input:focus{outline:2px solid var(--gold);outline-offset:-1px}
     <div class="brand">
       <h1>SAIDA PALAZZO</h1>
       <p>Toy zalı – interaktiv oturacaq planı</p>
+      <span class="sync" id="sync">Qoşulur…</span>
     </div>
     <div class="btns">
       <button class="btn" id="btn-edit">✥ Masaların yerini dəyiş</button>
@@ -171,7 +176,7 @@ input:focus{outline:2px solid var(--gold);outline-offset:-1px}
           <div><span class="sw r"></span> Düzbucaqlı – 14 nəfərlik</div>
           <div><span class="sw c"></span> Dairəvi – 12 nəfərlik</div>
         </div>
-        <p class="hint">Masanın üzərinə klikləyin – həmin masanın tutumu qədər ad yeri açılacaq. Hər şey avtomatik yadda saxlanılır.</p>
+        <p class="hint">Masanın üzərinə klikləyin – həmin masanın tutumu qədər ad yeri açılacaq. Hər şey avtomatik yadda saxlanılır və linki açan hər kəsdə görünür.</p>
       </div>
     </aside>
 
@@ -206,6 +211,7 @@ input:focus{outline:2px solid var(--gold);outline-offset:-1px}
 <script>
 (function(){
   var KEY='meridian_palazzo_plan_v1';
+  var API='api/plan', POLL_MS=3000, OFFLINE_POLL_MS=15000;
   var EXTRA=0, S=1.1, OX=50, OY=120, CW=867, CH=1196;
   var RECT={w:104,h:46}, ROUND={w:68,h:68};
 
@@ -226,10 +232,11 @@ input:focus{outline:2px solid var(--gold);outline-offset:-1px}
     return t;
   }
 
-  var tables=[], activeId=null, editMode=false, scale=1;
+  var tables=[], activeId=null, editMode=false, scale=1, drag=null;
   var $=function(i){return document.getElementById(i)};
   var scaler=$('scaler'), stage=$('stage');
 
+  // Local copy: shown instantly on open and kept when the server is unreachable.
   function load(){
     try{var raw=localStorage.getItem(KEY); if(raw){var d=JSON.parse(raw); if(Array.isArray(d)&&d.length){tables=d;return;}}}catch(e){}
     tables=buildDefault();
@@ -238,6 +245,123 @@ input:focus{outline:2px solid var(--gold);outline-offset:-1px}
   function save(){
     clearTimeout(saveTimer);
     saveTimer=setTimeout(function(){try{localStorage.setItem(KEY,JSON.stringify(tables))}catch(e){}},200);
+  }
+
+  // ---------- Server sync ----------
+  // The server keeps one field per table (meta:<id>) and one per seat (name:<id>:<i>).
+  // Changes are queued per field and flushed in batches; polling pulls in other people's edits.
+  var online=false, synced=false, pending={}, pendingReplace=false, flushTimer=null, pollTimer=null, writes=0, epoch=0;
+
+  function metaOf(t){return JSON.stringify({num:t.num,shape:t.shape,cap:t.cap,x:t.x,y:t.y})}
+  function toFields(list){
+    var f={};
+    list.forEach(function(t){
+      f['meta:'+t.id]=metaOf(t);
+      for(var i=0;i<t.names.length;i++){var n=t.names[i]||'';if(n.trim())f['name:'+t.id+':'+i]=n;}
+    });
+    return f;
+  }
+  function fromFields(f){
+    var by={};
+    Object.keys(f).forEach(function(k){
+      var p=k.split(':');if(p[0]!=='meta')return;
+      try{var m=JSON.parse(f[k]);}catch(e){return;}
+      by[p[1]]={id:+p[1],num:String(m.num),shape:m.shape==='rect'?'rect':'round',cap:Math.max(1,Math.min(40,+m.cap||1)),x:+m.x||0,y:+m.y||0,names:[]};
+    });
+    Object.keys(f).forEach(function(k){
+      var p=k.split(':');if(p[0]==='name'&&by[p[1]])by[p[1]].names[+p[2]]=f[k];
+    });
+    return Object.keys(by).map(function(k){var t=by[k];for(var i=0;i<t.names.length;i++)t.names[i]=t.names[i]||'';return t;})
+      .sort(function(a,b){return a.id-b.id});
+  }
+  function canon(f){return Object.keys(f).sort().map(function(k){return k+'\u0000'+f[k]}).join('\u0001')}
+
+  function setOnline(v){
+    online=v;
+    var el=$('sync');
+    el.className='sync '+(v?'ok':'off');
+    el.textContent=v?'Bütün cihazlarla sinxron':'Oflayn – dəyişikliklər bu brauzerdə saxlanılır';
+  }
+  function queue(field,value){pending[field]=value;save();scheduleFlush();}
+  function queueTable(t){queue('meta:'+t.id,metaOf(t))}
+  function queueName(t,i){var v=t.names[i]||'';queue('name:'+t.id+':'+i,v.trim()?v:null)}
+  function replaceAll(){pending={};pendingReplace=true;save();scheduleFlush();}
+  function scheduleFlush(){clearTimeout(flushTimer);flushTimer=setTimeout(flush,400);}
+
+  function post(body){
+    writes++;epoch++;
+    return fetch(API,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+      .then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);})
+      .finally(function(){writes--;epoch++;});
+  }
+  function flush(){
+    if(!online||!synced)return;
+    var body, batch=pending;
+    if(pendingReplace){
+      pendingReplace=false;pending={};batch={};
+      body={replace:true,set:toFields(tables)};
+    }else{
+      var keys=Object.keys(batch);if(!keys.length)return;
+      pending={};
+      body={set:{},del:[]};
+      keys.forEach(function(k){if(batch[k]===null)body.del.push(k);else body.set[k]=batch[k];});
+    }
+    post(body).catch(function(){
+      if(body.replace)pendingReplace=true;
+      Object.keys(batch).forEach(function(k){if(!(k in pending))pending[k]=batch[k];});
+      setOnline(false);
+    });
+  }
+
+  function poll(){
+    clearTimeout(pollTimer);
+    if(document.hidden&&synced){pollTimer=setTimeout(poll,POLL_MS);return;}
+    var e0=epoch;
+    fetch(API,{cache:'no-store'})
+      .then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})
+      .then(function(d){
+        var fields=d.fields||{};
+        setOnline(true);
+        if(!synced){
+          synced=true;
+          // Very first use: publish whatever this browser already has.
+          if(!Object.keys(fields).length){replaceAll();return;}
+        }
+        if(writes===0&&epoch===e0)applyRemote(fields);
+        if(pendingReplace||Object.keys(pending).length)scheduleFlush();
+      })
+      .catch(function(){setOnline(false);})
+      .then(function(){pollTimer=setTimeout(poll,online?POLL_MS:OFFLINE_POLL_MS);});
+  }
+  document.addEventListener('visibilitychange',function(){if(!document.hidden)poll();});
+
+  function applyRemote(fields){
+    if(drag||pendingReplace)return;
+    // Edits not yet sent win over what the server has.
+    Object.keys(pending).forEach(function(k){if(pending[k]===null)delete fields[k];else fields[k]=pending[k];});
+    if(canon(fields)!==canon(toFields(tables))){
+      var next=fromFields(fields);if(!next.length)return;
+      tables=next;save();
+      render();runSearch();
+    }
+    // Also on unchanged data: a rebuild skipped earlier (user was typing) catches up here.
+    var t=cur();
+    if(activeId!==null&&!t){closeDrawer();return;}
+    if(t)syncDrawer(t);
+  }
+  // Refresh the open drawer without disturbing the field being typed in.
+  function syncDrawer(t){
+    var focused=document.activeElement;
+    $('d-title').textContent='Masa '+t.num;
+    if(focused!==$('d-num'))$('d-num').value=t.num;
+    if(focused!==$('d-cap'))$('d-cap').value=t.cap;
+    var inputs=$('d-names').querySelectorAll('input');
+    if(inputs.length!==slots(t)){
+      if(!$('d-names').contains(focused))buildNames(t);
+      return;
+    }
+    inputs.forEach(function(inp,i){if(inp!==focused&&inp.value!==(t.names[i]||''))inp.value=t.names[i]||'';});
+    updateCount(t);
   }
   function toast(m){var t=$('toast');t.textContent=m;t.classList.add('show');clearTimeout(toast._t);toast._t=setTimeout(function(){t.classList.remove('show')},2200);}
 
@@ -317,7 +441,8 @@ input:focus{outline:2px solid var(--gold);outline-offset:-1px}
         var inp=document.createElement('input');inp.type='text';inp.value=t.names[i]||'';
         inp.placeholder='Ad Soyad';
         inp.autocomplete='off';
-        inp.addEventListener('input',function(){t.names[i]=inp.value;save();refreshNode(t);stats();updateCount(t);runSearch();});
+        inp.maxLength=200;
+        inp.addEventListener('input',function(){var t=cur();if(!t)return;t.names[i]=inp.value;queueName(t,i);refreshNode(t);stats();updateCount(t);runSearch();});
         inp.addEventListener('keydown',function(e){
           if(e.key==='Enter'){e.preventDefault();var nx=box.querySelectorAll('input')[i+1];if(nx)nx.focus();}
         });
@@ -331,23 +456,23 @@ input:focus{outline:2px solid var(--gold);outline-offset:-1px}
   function updateCount(t){$('d-count').textContent='Yazılıb: '+filled(t)+' / '+slots(t);}
   function cur(){return tables.find(function(x){return x.id===activeId})}
 
-  $('d-num').addEventListener('input',function(){var t=cur();if(!t)return;t.num=this.value.trim()||t.num;$('d-title').textContent='Masa '+t.num;refreshNode(t);save();});
+  $('d-num').addEventListener('input',function(){var t=cur();if(!t)return;t.num=this.value.trim()||t.num;$('d-title').textContent='Masa '+t.num;refreshNode(t);queueTable(t);});
   $('d-cap').addEventListener('input',function(){
     var t=cur();if(!t)return;var v=parseInt(this.value,10);if(!v||v<1)return;t.cap=Math.min(v,40);
-    buildNames(t);refreshNode(t);stats();save();
+    buildNames(t);refreshNode(t);stats();queueTable(t);
   });
   $('d-clear').addEventListener('click',function(){
     var t=cur();if(!t)return;
     if(!filled(t))return;
     if(!window.confirm('Masa '+t.num+' üzrə bütün adlar silinsin?'))return;
-    t.names=[];buildNames(t);refreshNode(t);stats();save();
+    for(var i=0;i<t.names.length;i++){if(t.names[i]){t.names[i]='';queueName(t,i);}}
+    buildNames(t);refreshNode(t);stats();
   });
   $('d-close').addEventListener('click',closeDrawer);
   $('overlay').addEventListener('click',closeDrawer);
   document.addEventListener('keydown',function(e){if(e.key==='Escape')closeDrawer();});
 
   // ---------- Drag (yalnız redaktə rejimində) ----------
-  var drag=null;
   function startDrag(e,t,node){
     if(!editMode){return;}
     e.preventDefault();
@@ -369,7 +494,7 @@ input:focus{outline:2px solid var(--gold);outline-offset:-1px}
   function onUp(){
     if(!drag)return;
     drag.node.removeEventListener('pointermove',onMove);drag.node.removeEventListener('pointerup',onUp);drag.node.removeEventListener('pointercancel',onUp);
-    drag=null;save();
+    var t=drag.t;drag=null;queueTable(t);
   }
   // klik
   scaler.addEventListener('click',function(e){
@@ -433,12 +558,12 @@ input:focus{outline:2px solid var(--gold);outline-offset:-1px}
   });
   $('btn-import').addEventListener('click',function(){
     var c=window.prompt('Yedək kodunu bura yapışdırın:');if(!c)return;
-    try{var d=JSON.parse(decodeURIComponent(escape(atob(c.trim()))));if(!Array.isArray(d))throw 0;tables=d;save();closeDrawer();render();toast('Plan yükləndi.');}
+    try{var d=JSON.parse(decodeURIComponent(escape(atob(c.trim()))));if(!Array.isArray(d))throw 0;tables=d;replaceAll();closeDrawer();render();toast('Plan yükləndi.');}
     catch(e){toast('Kod oxunmadı.');}
   });
   $('btn-reset').addEventListener('click',function(){
-    if(!window.confirm('Bütün adlar və masa yerləri sıfırlansın?'))return;
-    tables=buildDefault();try{localStorage.removeItem(KEY)}catch(e){}
+    if(!window.confirm('Bütün adlar və masa yerləri HAMI üçün sıfırlansın?'))return;
+    tables=buildDefault();replaceAll();
     closeDrawer();render();toast('Plan eskiz vəziyyətinə qaytarıldı.');
   });
 
@@ -453,6 +578,7 @@ input:focus{outline:2px solid var(--gold);outline-offset:-1px}
 
   load();addZones();render();fit();
   setTimeout(fit,100);
+  poll();
 })();
 </script>
 </body>
