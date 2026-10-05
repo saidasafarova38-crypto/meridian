@@ -1,4 +1,6 @@
-// Shared seating-plan storage on Upstash Redis (Vercel Marketplace → Storage → Upstash for Redis).
+// Shared seating-plan storage in Redis. Works with either Vercel storage integration:
+//   - "Redis" (Redis Cloud)   -> REDIS_URL, TCP connection
+//   - "Upstash for Redis"     -> KV_REST_API_URL/TOKEN or UPSTASH_REDIS_REST_URL/TOKEN, HTTP
 // The whole plan is one Redis hash:
 //   meta:<tableId>        -> table JSON {num, shape, cap, x, y}
 //   name:<tableId>:<seat> -> guest name
@@ -8,30 +10,74 @@ const FIELD = /^(meta:\d{1,4}|name:\d{1,4}:\d{1,2})$/;
 const MAX_FIELDS = 3000;
 const MAX_VALUE = 500;
 
-const BASE = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
-const TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+const REST_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
+const REST_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+const REDIS_URL = process.env.REDIS_URL || process.env.KV_URL;
 
-async function redis(path, body) {
-  const r = await fetch(BASE + path, {
+// ---------- Upstash REST ----------
+async function rest(path, body) {
+  const r = await fetch(REST_URL + path, {
     method: 'POST',
-    headers: { Authorization: 'Bearer ' + TOKEN, 'Content-Type': 'application/json' },
+    headers: { Authorization: 'Bearer ' + REST_TOKEN, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
   const data = await r.json();
   if (!r.ok || data.error) throw new Error(data.error || 'redis ' + r.status);
   return data;
 }
+const restStore = {
+  async read() {
+    const { result } = await rest('', ['HGETALL', KEY]);
+    const fields = {};
+    for (let i = 0; i < result.length; i += 2) fields[result[i]] = result[i + 1];
+    return fields;
+  },
+  async write({ replace, del, set }) {
+    const cmds = [];
+    if (replace) cmds.push(['DEL', KEY]);
+    if (del.length) cmds.push(['HDEL', KEY, ...del]);
+    const keys = Object.keys(set);
+    if (keys.length) cmds.push(['HSET', KEY, ...keys.flatMap((k) => [k, set[k]])]);
+    if (!cmds.length) return;
+    const out = await rest('/multi-exec', cmds);
+    const failed = Array.isArray(out) && out.find((o) => o && o.error);
+    if (failed) throw new Error(failed.error);
+  },
+};
+
+// ---------- TCP (node-redis), connection reused across warm invocations ----------
+let clientPromise = null;
+function tcpClient() {
+  if (!clientPromise) {
+    const { createClient } = require('redis');
+    const client = createClient({ url: REDIS_URL, socket: { connectTimeout: 5000 } });
+    client.on('error', () => { clientPromise = null; });
+    clientPromise = client.connect().then(() => client, (e) => { clientPromise = null; throw e; });
+  }
+  return clientPromise;
+}
+const tcpStore = {
+  async read() {
+    return (await tcpClient()).hGetAll(KEY);
+  },
+  async write({ replace, del, set }) {
+    const tx = (await tcpClient()).multi();
+    if (replace) tx.del(KEY);
+    if (del.length) tx.hDel(KEY, del);
+    if (Object.keys(set).length) tx.hSet(KEY, set);
+    await tx.exec();
+  },
+};
+
+const store = REST_URL && REST_TOKEN ? restStore : REDIS_URL ? tcpStore : null;
 
 module.exports = async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
-  if (!BASE || !TOKEN) return res.status(503).json({ error: 'storage not configured' });
+  if (!store) return res.status(503).json({ error: 'storage not configured' });
 
   try {
     if (req.method === 'GET') {
-      const { result } = await redis('', ['HGETALL', KEY]);
-      const fields = {};
-      for (let i = 0; i < result.length; i += 2) fields[result[i]] = result[i + 1];
-      return res.status(200).json({ fields });
+      return res.status(200).json({ fields: await store.read() });
     }
 
     if (req.method === 'POST') {
@@ -46,16 +92,7 @@ module.exports = async (req, res) => {
       for (const f of keys) {
         if (typeof set[f] !== 'string' || set[f].length > MAX_VALUE) return res.status(400).json({ error: 'bad value' });
       }
-
-      const cmds = [];
-      if (body.replace === true) cmds.push(['DEL', KEY]);
-      if (del.length) cmds.push(['HDEL', KEY, ...del]);
-      if (keys.length) cmds.push(['HSET', KEY, ...keys.flatMap((k) => [k, set[k]])]);
-      if (cmds.length) {
-        const out = await redis('/multi-exec', cmds);
-        const failed = Array.isArray(out) && out.find((o) => o && o.error);
-        if (failed) throw new Error(failed.error);
-      }
+      await store.write({ replace: body.replace === true, del, set });
       return res.status(200).json({ ok: true });
     }
 
