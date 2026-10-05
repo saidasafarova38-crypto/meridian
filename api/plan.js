@@ -10,9 +10,19 @@ const FIELD = /^(meta:\d{1,4}|name:\d{1,4}:\d{1,2})$/;
 const MAX_FIELDS = 3000;
 const MAX_VALUE = 500;
 
-const REST_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
-const REST_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
-const REDIS_URL = process.env.REDIS_URL || process.env.KV_URL;
+// Vercel lets you pick a custom prefix when connecting a store (e.g. STORAGE_REDIS_URL),
+// so match on the suffix rather than the exact name.
+function env(...suffixes) {
+  for (const s of suffixes) {
+    if (process.env[s]) return process.env[s];
+    const k = Object.keys(process.env).find((n) => n.endsWith('_' + s) && process.env[n]);
+    if (k) return process.env[k];
+  }
+  return undefined;
+}
+const REST_URL = env('KV_REST_API_URL', 'UPSTASH_REDIS_REST_URL');
+const REST_TOKEN = env('KV_REST_API_TOKEN', 'UPSTASH_REDIS_REST_TOKEN');
+const REDIS_URL = env('REDIS_URL', 'KV_URL');
 
 // ---------- Upstash REST ----------
 async function rest(path, body) {
@@ -73,7 +83,11 @@ const store = REST_URL && REST_TOKEN ? restStore : REDIS_URL ? tcpStore : null;
 
 module.exports = async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
-  if (!store) return res.status(503).json({ error: 'storage not configured' });
+  if (!store) {
+    // Names only (never values), to tell "store not connected" from "connected under another name".
+    const seen = Object.keys(process.env).filter((n) => /REDIS|UPSTASH|KV_/.test(n));
+    return res.status(503).json({ error: 'storage not configured', env: seen, vercelEnv: process.env.VERCEL_ENV || null });
+  }
 
   try {
     if (req.method === 'GET') {
